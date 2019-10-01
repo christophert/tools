@@ -6,7 +6,10 @@
 function Create-UserProfile {
     <#
         .SYNOPSIS
-            Function to create a user profile for a domain user through the Win32 USERENV API.
+            Creates a user profile for a domain user using the Win32 USERENV API.
+            This allows system administrators to add users to new machines without
+            requiring the user to be present. This allows administrators to restore
+            profiles before a machine is delivered to a user.
 
         .EXAMPLE
             Create-UserProfile -UserSid S-1-5-21-12345678-12341234512-9999 -UserName user.name
@@ -55,7 +58,6 @@ function Create-UserProfile {
         Write-Host "Profile location: $($userProfilePath)"
     }
 }
-
 
 Do {
     Do {
