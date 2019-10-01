@@ -10,6 +10,11 @@ function Create-UserProfile {
 
         .EXAMPLE
             Create-UserProfile -UserSid S-1-5-21-12345678-12341234512-9999 -UserName user.name
+        .NOTES
+            Christopher Tran
+            code@christran.in
+        .LINK
+            https://github.com/christophert/tools/powershell/AD-Add-UserProfile
     #>
     Param (
         # Account SID
