@@ -1,0 +1,7 @@
+*.key
+*.csr
+*.cer
+*.crt
+*.pem
+*.cnf
+!conf/certs_with_san.cnf
