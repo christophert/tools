@@ -1,0 +1,4 @@
+proxmoxer
+python-ldap
+python-dotenv
+requests
