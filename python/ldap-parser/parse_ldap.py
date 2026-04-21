@@ -557,6 +557,51 @@ def build_dn_to_sid_map(conn: sqlite3.Connection) -> dict:
     return mapping
 
 
+def build_memberof_reverse_map(entries: list, dn_to_sid: dict, dn_to_type: dict) -> dict:
+    """
+    Scan all entries for memberOf attributes and build a reverse membership map.
+    Returns {group_dn_lower: [{"MemberId": sid, "MemberType": type}, ...]}
+    """
+    reverse = {}
+    for entry in entries:
+        attrs = entry.get("attrs", {})
+        member_of_dns = attrs.get("memberOf", [])
+        if not member_of_dns:
+            continue
+        obj_dn_lower = entry["dn"].lower()
+        obj_sid = dn_to_sid.get(obj_dn_lower)
+        if not obj_sid:
+            continue
+        obj_type = dn_to_type.get(obj_dn_lower, "Base")
+        for group_dn in member_of_dns:
+            group_dn_lower = group_dn.lower()
+            if group_dn_lower not in dn_to_sid:
+                continue
+            reverse.setdefault(group_dn_lower, []).append(
+                {"MemberId": obj_sid, "MemberType": obj_type}
+            )
+    return reverse
+
+
+def merge_memberof_into_groups(group_nodes: list, reverse: dict, dn_to_sid: dict) -> None:
+    """
+    Merge reverse memberOf map into group nodes' Members arrays in place.
+    Deduplicates by MemberId.
+    """
+    sid_to_group_dn = {sid: dn for dn, sid in dn_to_sid.items()}
+    for node in group_nodes:
+        group_sid = node["ObjectIdentifier"]
+        group_dn = sid_to_group_dn.get(group_sid, "").lower()
+        additional = reverse.get(group_dn, [])
+        if not additional:
+            continue
+        existing_ids = {m["MemberId"] for m in node["Members"]}
+        for member in additional:
+            if member["MemberId"] not in existing_ids:
+                node["Members"].append(member)
+                existing_ids.add(member["MemberId"])
+
+
 def build_dn_to_type_map(conn: sqlite3.Connection) -> dict:
     mapping = {}
     rows = conn.execute("SELECT dn, object_class FROM entries").fetchall()
@@ -641,6 +686,7 @@ def cmd_export_bh(args):
     all_rows = conn.execute("SELECT dn, object_class, attrs_json FROM entries").fetchall()
 
     buckets = {"users": [], "groups": [], "computers": [], "domains": [], "ous": []}
+    all_entries = []
 
     for row in all_rows:
         classes = (row["object_class"] or "").lower().split(",")
@@ -656,6 +702,7 @@ def cmd_export_bh(args):
             attrs[k] = decoded
 
         entry = {"dn": row["dn"], "attrs": attrs}
+        all_entries.append(entry)
 
         if "computer" in classes:
             node = build_bh_computer(entry, domain_fqdn, domain_sid)
@@ -677,6 +724,9 @@ def cmd_export_bh(args):
             node = build_bh_ou(entry, domain_fqdn)
             if node:
                 buckets["ous"].append(node)
+
+    reverse = build_memberof_reverse_map(all_entries, dn_to_sid, dn_to_type)
+    merge_memberof_into_groups(buckets["groups"], reverse, dn_to_sid)
 
     type_map = {
         "users": "users",

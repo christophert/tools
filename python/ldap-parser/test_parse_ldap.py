@@ -391,3 +391,152 @@ def test_build_dn_to_sid_map():
     key = "cn=alice,dc=corp,dc=com"
     assert key in mapping
     assert mapping[key] == "S-1-5-21-111-222-333-1000"
+
+
+# ---------------------------------------------------------------------------
+# memberOf reverse membership
+# ---------------------------------------------------------------------------
+
+GROUP_DN = "CN=Domain Admins,CN=Users,DC=corp,DC=example,DC=com"
+USER_DN = "CN=alice,OU=Users,DC=corp,DC=example,DC=com"
+USER_SID = "S-1-5-21-111-222-333-1000"
+GROUP_SID = "S-1-5-21-111-222-333-512"
+
+
+def _make_memberof_scenario():
+    """
+    Group has no member attribute. User has memberOf pointing to the group.
+    Returns (dn_to_sid, dn_to_type, group_entry, user_entry).
+    """
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+    user_sid_raw = _make_sid_bytes([21, 111, 222, 333, 1000])
+
+    group_entry = {
+        "dn": GROUP_DN,
+        "attrs": {
+            "objectClass": ["top", "group"],
+            "sAMAccountName": ["Domain Admins"],
+            "objectSid": [group_sid_raw],
+            # no "member" key intentionally
+        },
+    }
+    user_entry = {
+        "dn": USER_DN,
+        "attrs": {
+            "objectClass": ["top", "person", "user"],
+            "sAMAccountName": ["alice"],
+            "objectSid": [user_sid_raw],
+            "memberOf": [GROUP_DN],
+        },
+    }
+
+    dn_to_sid = {
+        GROUP_DN.lower(): GROUP_SID,
+        USER_DN.lower(): USER_SID,
+    }
+    dn_to_type = {
+        GROUP_DN.lower(): "Group",
+        USER_DN.lower(): "User",
+    }
+    return dn_to_sid, dn_to_type, group_entry, user_entry
+
+
+def test_build_memberof_reverse_map():
+    dn_to_sid, dn_to_type, group_entry, user_entry = _make_memberof_scenario()
+    entries = [group_entry, user_entry]
+    reverse = p.build_memberof_reverse_map(entries, dn_to_sid, dn_to_type)
+    assert GROUP_DN.lower() in reverse
+    members = reverse[GROUP_DN.lower()]
+    assert len(members) == 1
+    assert members[0]["MemberId"] == USER_SID
+    assert members[0]["MemberType"] == "User"
+
+
+def test_merge_memberof_into_groups_no_member_attr():
+    """Group has no member attribute; user's memberOf should populate Members."""
+    dn_to_sid, dn_to_type, group_entry, user_entry = _make_memberof_scenario()
+
+    group_node = p.build_bh_group(group_entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
+    assert group_node["Members"] == []  # empty before merge
+
+    reverse = p.build_memberof_reverse_map([group_entry, user_entry], dn_to_sid, dn_to_type)
+    p.merge_memberof_into_groups([group_node], reverse, dn_to_sid)
+
+    assert len(group_node["Members"]) == 1
+    assert group_node["Members"][0]["MemberId"] == USER_SID
+
+
+def test_merge_memberof_deduplicates():
+    """If user appears in both group's member attr AND user's memberOf, include only once."""
+    dn_to_sid, dn_to_type, group_entry, user_entry = _make_memberof_scenario()
+    # Also add member attribute on the group (same user)
+    group_entry["attrs"]["member"] = [USER_DN]
+
+    group_node = p.build_bh_group(group_entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
+    assert len(group_node["Members"]) == 1  # from member attr
+
+    reverse = p.build_memberof_reverse_map([group_entry, user_entry], dn_to_sid, dn_to_type)
+    p.merge_memberof_into_groups([group_node], reverse, dn_to_sid)
+
+    assert len(group_node["Members"]) == 1  # still 1, not duplicated
+
+
+def test_merge_memberof_multiple_groups():
+    """User with memberOf pointing to two groups populates both."""
+    group2_dn = "CN=IT Staff,CN=Users,DC=corp,DC=example,DC=com"
+    group2_sid_raw = _make_sid_bytes([21, 111, 222, 333, 1100])
+    group2_sid = "S-1-5-21-111-222-333-1100"
+    user_sid_raw = _make_sid_bytes([21, 111, 222, 333, 1000])
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+
+    dn_to_sid = {
+        GROUP_DN.lower(): GROUP_SID,
+        group2_dn.lower(): group2_sid,
+        USER_DN.lower(): USER_SID,
+    }
+    dn_to_type = {
+        GROUP_DN.lower(): "Group",
+        group2_dn.lower(): "Group",
+        USER_DN.lower(): "User",
+    }
+
+    user_entry = {
+        "dn": USER_DN,
+        "attrs": {
+            "objectClass": ["user"],
+            "sAMAccountName": ["alice"],
+            "objectSid": [user_sid_raw],
+            "memberOf": [GROUP_DN, group2_dn],
+        },
+    }
+    group1_entry = {"dn": GROUP_DN, "attrs": {"objectClass": ["group"], "sAMAccountName": ["Domain Admins"], "objectSid": [group_sid_raw]}}
+    group2_entry = {"dn": group2_dn, "attrs": {"objectClass": ["group"], "sAMAccountName": ["IT Staff"], "objectSid": [group2_sid_raw]}}
+
+    node1 = p.build_bh_group(group1_entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
+    node2 = p.build_bh_group(group2_entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
+
+    reverse = p.build_memberof_reverse_map([group1_entry, group2_entry, user_entry], dn_to_sid, dn_to_type)
+    p.merge_memberof_into_groups([node1, node2], reverse, dn_to_sid)
+
+    assert any(m["MemberId"] == USER_SID for m in node1["Members"])
+    assert any(m["MemberId"] == USER_SID for m in node2["Members"])
+
+
+def test_merge_memberof_skips_unknown_group_dn():
+    """memberOf pointing to a DN not in dn_to_sid is silently skipped."""
+    user_sid_raw = _make_sid_bytes([21, 111, 222, 333, 1000])
+    user_entry = {
+        "dn": USER_DN,
+        "attrs": {
+            "objectClass": ["user"],
+            "sAMAccountName": ["alice"],
+            "objectSid": [user_sid_raw],
+            "memberOf": ["CN=UnknownGroup,DC=other,DC=com"],
+        },
+    }
+    dn_to_sid = {USER_DN.lower(): USER_SID}
+    dn_to_type = {USER_DN.lower(): "User"}
+
+    reverse = p.build_memberof_reverse_map([user_entry], dn_to_sid, dn_to_type)
+    # No known group DN in reverse map, no crash
+    assert reverse == {}
