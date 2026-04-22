@@ -704,6 +704,34 @@ def _ldif_with_wrapped_memberof():
     )
 
 
+# ---------------------------------------------------------------------------
+# derive_domain_sid
+# ---------------------------------------------------------------------------
+
+def test_derive_domain_sid_from_user_sid():
+    dn_to_sid = {"cn=alice,dc=corp,dc=com": "S-1-5-21-111-222-333-1000"}
+    assert p.derive_domain_sid(dn_to_sid) == "S-1-5-21-111-222-333"
+
+
+def test_derive_domain_sid_ignores_builtin():
+    # S-1-5-32-* are local BUILTIN SIDs, not domain SIDs
+    dn_to_sid = {
+        "cn=administrators,cn=builtin,dc=corp,dc=com": "S-1-5-32-544",
+        "cn=alice,dc=corp,dc=com": "S-1-5-21-111-222-333-1000",
+    }
+    assert p.derive_domain_sid(dn_to_sid) == "S-1-5-21-111-222-333"
+
+
+def test_derive_domain_sid_returns_none_when_empty():
+    assert p.derive_domain_sid({}) is None
+
+
+def test_derive_domain_sid_ignores_short_sids():
+    # SIDs with fewer than 8 components can't have a domain prefix stripped
+    dn_to_sid = {"cn=x,dc=corp,dc=com": "S-1-5-21-111"}
+    assert p.derive_domain_sid(dn_to_sid) is None
+
+
 def test_e2e_ldif_parses_two_entries():
     ldif = _ldif_with_wrapped_memberof()
     entries = p.parse_ldif(ldif)

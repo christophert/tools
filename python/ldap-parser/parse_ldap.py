@@ -551,6 +551,20 @@ def _filetime_to_unix(value: str) -> int | None:
     return int((v - FILETIME_EPOCH_DELTA) / 10_000_000)
 
 
+def derive_domain_sid(dn_to_sid: dict) -> str | None:
+    """Derive domain SID from any user/group SID by stripping the RID component.
+
+    AD user/group SIDs have the form S-1-5-21-X-Y-Z-RID (8 dash-separated
+    parts).  The domain SID is S-1-5-21-X-Y-Z (7 parts).  BUILTIN SIDs
+    (S-1-5-32-*) and other short SIDs are skipped.
+    """
+    for sid in dn_to_sid.values():
+        parts = sid.split("-")
+        if len(parts) == 8 and parts[3] == "21":
+            return "-".join(parts[:7])
+    return None
+
+
 def build_dn_to_sid_map(conn: sqlite3.Connection) -> dict:
     mapping = {}
     rows = conn.execute(
@@ -692,12 +706,17 @@ def cmd_export_bh(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     domain_fqdn = args.domain or get_meta(conn, "domain_fqdn") or "UNKNOWN.DOMAIN"
-    domain_sid = get_meta(conn, "domain_sid") or ""
-
-    log.info("Domain: %s  SID: %s", domain_fqdn, domain_sid)
+    domain_sid = getattr(args, "domain_sid", None) or get_meta(conn, "domain_sid") or ""
 
     dn_to_sid = build_dn_to_sid_map(conn)
     dn_to_type = build_dn_to_type_map(conn)
+
+    if not domain_sid:
+        domain_sid = derive_domain_sid(dn_to_sid) or ""
+        if domain_sid:
+            log.info("Derived domain SID from entry SIDs: %s", domain_sid)
+
+    log.info("Domain: %s  SID: %s", domain_fqdn, domain_sid)
 
     all_rows = conn.execute("SELECT dn, object_class, attrs_json FROM entries").fetchall()
 
@@ -829,6 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bh.add_argument("-d", "--db", default="ldap.db", metavar="DB_FILE")
     p_bh.add_argument("-o", "--output", default=".", metavar="OUTPUT_DIR")
     p_bh.add_argument("--domain", default=None, metavar="FQDN")
+    p_bh.add_argument("--domain-sid", dest="domain_sid", default=None, metavar="SID")
 
     p_query = sub.add_parser("query", help="Query the SQLite database")
     p_query.add_argument("-d", "--db", default="ldap.db", metavar="DB_FILE")
