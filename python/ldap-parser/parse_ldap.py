@@ -409,6 +409,7 @@ def build_bh_user(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | None
         "SPNTargets": [],
         "HasSIDHistory": [],
         "IsACLProtected": False,
+        "IsDeleted": False,
         "Aces": [],
     }
 
@@ -430,7 +431,7 @@ def build_bh_group(entry: dict, domain_fqdn: str, domain_sid: str,
         if not msid:
             continue
         mtype = dn_to_type.get(mdn_lower, "Base")
-        members.append({"MemberId": msid, "MemberType": mtype})
+        members.append({"ObjectIdentifier": msid, "ObjectType": mtype})
 
     props = {
         "name": name,
@@ -448,6 +449,7 @@ def build_bh_group(entry: dict, domain_fqdn: str, domain_sid: str,
         "ObjectIdentifier": sid,
         "Members": members,
         "IsACLProtected": False,
+        "IsDeleted": False,
         "Aces": [],
     }
 
@@ -483,6 +485,7 @@ def build_bh_computer(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | 
         "Properties": props,
         "ObjectIdentifier": sid,
         "IsACLProtected": False,
+        "IsDeleted": False,
         "Aces": [],
     }
 
@@ -506,6 +509,7 @@ def build_bh_domain(entry: dict) -> dict | None:
         "Properties": props,
         "ObjectIdentifier": sid,
         "IsACLProtected": False,
+        "IsDeleted": False,
         "Aces": [],
     }
 
@@ -537,6 +541,7 @@ def build_bh_ou(entry: dict, domain_fqdn: str) -> dict | None:
         "Properties": props,
         "ObjectIdentifier": guid,
         "IsACLProtected": False,
+        "IsDeleted": False,
         "Aces": [],
     }
 
@@ -608,7 +613,7 @@ def build_memberof_reverse_map(entries: list, dn_to_sid: dict, dn_to_type: dict)
             if group_dn_lower not in dn_to_sid:
                 continue
             reverse.setdefault(group_dn_lower, []).append(
-                {"MemberId": obj_sid, "MemberType": obj_type}
+                {"ObjectIdentifier": obj_sid, "ObjectType": obj_type}
             )
     return reverse
 
@@ -625,11 +630,11 @@ def merge_memberof_into_groups(group_nodes: list, reverse: dict, dn_to_sid: dict
         additional = reverse.get(group_dn, [])
         if not additional:
             continue
-        existing_ids = {m["MemberId"] for m in node["Members"]}
+        existing_ids = {m["ObjectIdentifier"] for m in node["Members"]}
         for member in additional:
-            if member["MemberId"] not in existing_ids:
+            if member["ObjectIdentifier"] not in existing_ids:
                 node["Members"].append(member)
-                existing_ids.add(member["MemberId"])
+                existing_ids.add(member["ObjectIdentifier"])
 
 
 def build_dn_to_type_map(conn: sqlite3.Connection) -> dict:
@@ -779,7 +784,7 @@ def cmd_export_bh(args):
                 "methods": 0,
                 "type": type_map[key],
                 "count": len(data),
-                "version": 4,
+                "version": 5,
             },
         }
         out_file.write_text(json.dumps(payload, indent=2))

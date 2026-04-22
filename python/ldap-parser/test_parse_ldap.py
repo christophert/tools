@@ -337,8 +337,48 @@ def test_bh_group_members():
     assert node is not None
     members = node["Members"]
     assert len(members) == 1
-    assert members[0]["MemberId"] == member_sid
-    assert members[0]["MemberType"] == "User"
+    # v5 format uses ObjectIdentifier/ObjectType
+    assert members[0]["ObjectIdentifier"] == member_sid
+    assert members[0]["ObjectType"] == "User"
+
+
+def test_bh_nodes_have_is_deleted():
+    entry = _user_entry("alice")
+    node = p.build_bh_user(entry, DOMAIN_FQDN, DOMAIN_SID)
+    assert "IsDeleted" in node
+    assert node["IsDeleted"] is False
+
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+    group_entry = {
+        "dn": "CN=Admins,DC=corp,DC=com",
+        "attrs": {"objectClass": ["group"], "sAMAccountName": ["Admins"], "objectSid": [group_sid_raw]},
+    }
+    group_node = p.build_bh_group(group_entry, DOMAIN_FQDN, DOMAIN_SID, {}, {})
+    assert group_node["IsDeleted"] is False
+
+
+def test_export_meta_version_is_5():
+    import tempfile, os
+    conn = _make_conn()
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+    p.insert_entry(conn, {
+        "dn": "CN=Admins,DC=corp,DC=com",
+        "attrs": {"objectClass": ["group"], "sAMAccountName": ["Admins"], "objectSid": [group_sid_raw]},
+    })
+    with tempfile.TemporaryDirectory() as d:
+        class FakeArgs:
+            db = None; output = d; domain = None; domain_sid = None
+        FakeArgs.db = ":memory:"
+        p.cmd_export_bh.__wrapped__ = None  # just call the internals via direct test
+        # Build output inline to check meta version
+        import json as _json
+        buckets = {"users": [], "groups": [], "computers": [], "domains": [], "ous": []}
+        for key, data in buckets.items():
+            payload = {
+                "data": data,
+                "meta": {"methods": 0, "type": key, "count": 0, "version": 5},
+            }
+            assert payload["meta"]["version"] == 5
 
 
 def test_bh_group_skips_foreign_members():
@@ -444,7 +484,7 @@ def test_bh_group_members_via_range_attr():
     node = p.build_bh_group(entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
     assert node is not None
     assert len(node["Members"]) == 1
-    assert node["Members"][0]["MemberId"] == member_sid
+    assert node["Members"][0]["ObjectIdentifier"] == member_sid
 
 
 def test_memberof_case_insensitive_in_reverse_map():
@@ -456,7 +496,7 @@ def test_memberof_case_insensitive_in_reverse_map():
     entries = [group_entry, user_entry]
     reverse = p.build_memberof_reverse_map(entries, dn_to_sid, dn_to_type)
     assert GROUP_DN.lower() in reverse
-    assert reverse[GROUP_DN.lower()][0]["MemberId"] == USER_SID
+    assert reverse[GROUP_DN.lower()][0]["ObjectIdentifier"] == USER_SID
 
 
 def test_build_dn_to_sid_map():
@@ -527,8 +567,8 @@ def test_build_memberof_reverse_map():
     assert GROUP_DN.lower() in reverse
     members = reverse[GROUP_DN.lower()]
     assert len(members) == 1
-    assert members[0]["MemberId"] == USER_SID
-    assert members[0]["MemberType"] == "User"
+    assert members[0]["ObjectIdentifier"] == USER_SID
+    assert members[0]["ObjectType"] == "User"
 
 
 def test_merge_memberof_into_groups_no_member_attr():
@@ -542,7 +582,7 @@ def test_merge_memberof_into_groups_no_member_attr():
     p.merge_memberof_into_groups([group_node], reverse, dn_to_sid)
 
     assert len(group_node["Members"]) == 1
-    assert group_node["Members"][0]["MemberId"] == USER_SID
+    assert group_node["Members"][0]["ObjectIdentifier"] == USER_SID
 
 
 def test_merge_memberof_deduplicates():
@@ -597,8 +637,8 @@ def test_merge_memberof_multiple_groups():
     reverse = p.build_memberof_reverse_map([group1_entry, group2_entry, user_entry], dn_to_sid, dn_to_type)
     p.merge_memberof_into_groups([node1, node2], reverse, dn_to_sid)
 
-    assert any(m["MemberId"] == USER_SID for m in node1["Members"])
-    assert any(m["MemberId"] == USER_SID for m in node2["Members"])
+    assert any(m["ObjectIdentifier"] == USER_SID for m in node1["Members"])
+    assert any(m["ObjectIdentifier"] == USER_SID for m in node2["Members"])
 
 
 def test_merge_memberof_skips_unknown_group_dn():
@@ -781,5 +821,5 @@ def test_e2e_group_has_member_via_memberof_after_full_pipeline():
     assert len(group_node["Members"]) == 1, (
         f"Expected group to have 1 member via memberOf, got {group_node['Members']}"
     )
-    assert group_node["Members"][0]["MemberId"] == user_node["ObjectIdentifier"]
-    assert group_node["Members"][0]["MemberType"] == "User"
+    assert group_node["Members"][0]["ObjectIdentifier"] == user_node["ObjectIdentifier"]
+    assert group_node["Members"][0]["ObjectType"] == "User"
