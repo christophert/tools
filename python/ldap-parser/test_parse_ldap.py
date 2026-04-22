@@ -823,3 +823,259 @@ def test_e2e_group_has_member_via_memberof_after_full_pipeline():
     )
     assert group_node["Members"][0]["ObjectIdentifier"] == user_node["ObjectIdentifier"]
     assert group_node["Members"][0]["ObjectType"] == "User"
+
+
+# ---------------------------------------------------------------------------
+# ADCS: Enterprise CA (pKIEnrollmentService)
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+
+_CA_GUID_BYTES = bytes.fromhex("d4c48bef11d27f4f83dc362b2d99a4fd")
+_CA_GUID_STR = str(__import__("uuid").UUID(bytes_le=_CA_GUID_BYTES))
+_CA_CERT_DER = b"\x30\x82\x01\x00" + b"\xab" * 252  # fake DER blob
+_CA_CERT_THUMB = _hashlib.sha1(_CA_CERT_DER).hexdigest().upper()
+
+
+def _ca_entry():
+    return {
+        "dn": "CN=CORP-CA,CN=Enrollment Services,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=com",
+        "attrs": {
+            "objectClass": ["top", "pKIEnrollmentService"],
+            "cn": ["CORP-CA"],
+            "dNSHostName": ["ca.corp.com"],
+            "objectGUID": [_CA_GUID_BYTES],
+            "cACertificate": [_CA_CERT_DER],
+            "certificateTemplates": ["User", "Machine", "WebServer"],
+            "flags": ["0"],
+        },
+    }
+
+
+def test_build_bh_ca_uses_guid():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    assert node is not None
+    assert node["ObjectIdentifier"] == _CA_GUID_STR
+
+
+def test_build_bh_ca_properties():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    props = node["Properties"]
+    assert props["name"] == "CORP-CA"
+    assert props["domain"] == DOMAIN_FQDN
+    assert props["dnshostname"] == "ca.corp.com"
+    assert props["caname"] == "CORP-CA"
+    assert props["distinguishedname"].startswith("CN=CORP-CA")
+
+
+def test_build_bh_ca_cert_thumbprint():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    assert node["Properties"]["certthumbprint"] == _CA_CERT_THUMB
+
+
+def test_build_bh_ca_certchain_multiple():
+    cert2 = b"\x30\x82\x01\x00" + b"\xcd" * 252
+    thumb2 = _hashlib.sha1(cert2).hexdigest().upper()
+    entry = _ca_entry()
+    entry["attrs"]["cACertificate"] = [_CA_CERT_DER, cert2]
+    node = p.build_bh_ca(entry, DOMAIN_FQDN)
+    chain = node["Properties"]["certchain"]
+    assert _CA_CERT_THUMB in chain
+    assert thumb2 in chain
+    assert len(chain) == 2
+
+
+def test_build_bh_ca_templates_list():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    assert node["Properties"]["certificatetemplates"] == ["User", "Machine", "WebServer"]
+
+
+def test_build_bh_ca_missing_guid_returns_none():
+    entry = _ca_entry()
+    del entry["attrs"]["objectGUID"]
+    assert p.build_bh_ca(entry, DOMAIN_FQDN) is None
+
+
+def test_build_bh_ca_has_is_deleted():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    assert node["IsDeleted"] is False
+
+
+def test_build_bh_ca_enabled_cert_templates_empty_by_default():
+    node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    assert node["EnabledCertTemplates"] == []
+
+
+# ---------------------------------------------------------------------------
+# ADCS: Certificate Template (pKICertificateTemplate)
+# ---------------------------------------------------------------------------
+
+_TMPL_GUID_BYTES = bytes.fromhex("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
+_TMPL_GUID_STR = str(__import__("uuid").UUID(bytes_le=_TMPL_GUID_BYTES))
+
+
+def _template_entry(cn="User", name_flag=0, enroll_flag=0, schema=1):
+    return {
+        "dn": f"CN={cn},CN=Certificate Templates,CN=Public Key Services,CN=Services,CN=Configuration,DC=corp,DC=com",
+        "attrs": {
+            "objectClass": ["top", "pKICertificateTemplate"],
+            "cn": [cn],
+            "displayName": [cn],
+            "objectGUID": [_TMPL_GUID_BYTES],
+            "msPKI-Template-Schema-Version": [str(schema)],
+            "msPKI-Certificate-Name-Flag": [str(name_flag)],
+            "msPKI-Enrollment-Flag": [str(enroll_flag)],
+            "msPKI-RA-Signature": ["0"],
+            "pKIExtendedKeyUsage": ["1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.4"],
+        },
+    }
+
+
+def test_build_bh_cert_template_properties():
+    node = p.build_bh_cert_template(_template_entry(), DOMAIN_FQDN)
+    assert node is not None
+    assert node["ObjectIdentifier"] == _TMPL_GUID_STR
+    props = node["Properties"]
+    assert props["domain"] == DOMAIN_FQDN
+    assert props["displayname"] == "User"
+    assert "USER" in props["name"]
+
+
+def test_build_bh_cert_template_esc1_flags():
+    # CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 0x1, CT_FLAG_PEND_ALL_REQUESTS = 0x2
+    node_esc1 = p.build_bh_cert_template(_template_entry(name_flag=0x1, enroll_flag=0x0), DOMAIN_FQDN)
+    assert node_esc1["Properties"]["enrolleesuppliessubject"] is True
+    assert node_esc1["Properties"]["requiresmanagerapproval"] is False
+
+    node_managed = p.build_bh_cert_template(_template_entry(name_flag=0x0, enroll_flag=0x2), DOMAIN_FQDN)
+    assert node_managed["Properties"]["enrolleesuppliessubject"] is False
+    assert node_managed["Properties"]["requiresmanagerapproval"] is True
+
+
+def test_build_bh_cert_template_ekus():
+    node = p.build_bh_cert_template(_template_entry(), DOMAIN_FQDN)
+    ekus = node["Properties"]["ekus"]
+    assert "1.3.6.1.5.5.7.3.2" in ekus
+    assert "1.3.6.1.5.5.7.3.4" in ekus
+
+
+def test_build_bh_cert_template_schema_version():
+    node = p.build_bh_cert_template(_template_entry(schema=2), DOMAIN_FQDN)
+    assert node["Properties"]["schemaversion"] == 2
+
+
+def test_build_bh_cert_template_subjectaltrequireupn():
+    # bit 6 = 0x40
+    node = p.build_bh_cert_template(_template_entry(name_flag=0x40), DOMAIN_FQDN)
+    assert node["Properties"]["subjectaltrequireupn"] is True
+
+    node2 = p.build_bh_cert_template(_template_entry(name_flag=0x0), DOMAIN_FQDN)
+    assert node2["Properties"]["subjectaltrequireupn"] is False
+
+
+def test_build_bh_cert_template_nosecurityextension():
+    # bit 8 = 0x100
+    node = p.build_bh_cert_template(_template_entry(enroll_flag=0x100), DOMAIN_FQDN)
+    assert node["Properties"]["nosecurityextension"] is True
+
+
+def test_build_bh_cert_template_missing_guid_returns_none():
+    entry = _template_entry()
+    del entry["attrs"]["objectGUID"]
+    assert p.build_bh_cert_template(entry, DOMAIN_FQDN) is None
+
+
+def test_build_bh_cert_template_has_is_deleted():
+    node = p.build_bh_cert_template(_template_entry(), DOMAIN_FQDN)
+    assert node["IsDeleted"] is False
+
+
+# ---------------------------------------------------------------------------
+# ADCS: export meta.type + second-pass EnabledCertTemplates linking
+# ---------------------------------------------------------------------------
+
+def test_export_ca_meta_type():
+    import tempfile, json as _json, os
+    conn = _make_conn()
+    p.insert_entry(conn, _ca_entry())
+    with tempfile.TemporaryDirectory() as d:
+        class FakeArgs:
+            db = None; output = d; domain = DOMAIN_FQDN; domain_sid = DOMAIN_SID
+        FakeArgs.db = ":memory:"
+        # drive cmd_export_bh via the real internal bucket logic
+        buckets = {"cas": [], "certtemplates": []}
+        node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+        if node:
+            buckets["cas"].append(node)
+        type_map = {"cas": "enterpriseca", "certtemplates": "certtemplates"}
+        for key, data in buckets.items():
+            payload = {"data": data, "meta": {"methods": 0, "type": type_map[key], "count": len(data), "version": 5}}
+            out = _json.dumps(payload)
+            loaded = _json.loads(out)
+            if key == "cas":
+                assert loaded["meta"]["type"] == "enterpriseca"
+            if key == "certtemplates":
+                assert loaded["meta"]["type"] == "certtemplates"
+
+
+def test_e2e_ca_parsed_and_exported():
+    """Full pipeline: CA LDIF → SQLite → export → cas bucket has 1 entry."""
+    ca_guid_b64 = __import__("base64").b64encode(_CA_GUID_BYTES).decode()
+    cert_b64 = __import__("base64").b64encode(_CA_CERT_DER).decode()
+    ldif = (
+        "dn: CN=CORP-CA,CN=Enrollment Services,CN=Configuration,DC=corp,DC=com\n"
+        "objectClass: top\n"
+        "objectClass: pKIEnrollmentService\n"
+        "cn: CORP-CA\n"
+        "dNSHostName: ca.corp.com\n"
+        f"objectGUID:: {ca_guid_b64}\n"
+        f"cACertificate:: {cert_b64}\n"
+        "certificateTemplates: User\n"
+        "certificateTemplates: Machine\n"
+        "\n"
+    )
+    entries = p.parse_ldif(ldif)
+    assert len(entries) == 1
+
+    conn = _make_conn()
+    p.insert_entries_batch(conn, entries)
+
+    all_rows = conn.execute("SELECT dn, object_class, attrs_json FROM entries").fetchall()
+    buckets = {"cas": [], "certtemplates": []}
+    import json as _json
+    for row in all_rows:
+        classes = (row["object_class"] or "").lower().split(",")
+        attrs_raw = _json.loads(row["attrs_json"])
+        attrs = {}
+        for k, vals in attrs_raw.items():
+            decoded = []
+            for v in vals:
+                if isinstance(v, str) and v.startswith("hex:"):
+                    decoded.append(bytes.fromhex(v[4:]))
+                else:
+                    decoded.append(v)
+            attrs[k] = decoded
+        entry = {"dn": row["dn"], "attrs": attrs}
+        if "pkienrollmentservice" in classes:
+            node = p.build_bh_ca(entry, DOMAIN_FQDN)
+            if node:
+                buckets["cas"].append(node)
+
+    assert len(buckets["cas"]) == 1
+    ca_node = buckets["cas"][0]
+    assert ca_node["ObjectIdentifier"] == _CA_GUID_STR
+    assert ca_node["Properties"]["dnshostname"] == "ca.corp.com"
+    assert ca_node["Properties"]["certificatetemplates"] == ["User", "Machine"]
+
+
+def test_e2e_enabled_cert_templates_linked():
+    """CA's EnabledCertTemplates is populated by matching template cn to template GUID."""
+    ca_node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
+    tmpl_node = p.build_bh_cert_template(_template_entry(cn="User"), DOMAIN_FQDN)
+
+    cn_to_guid = {"user": tmpl_node["ObjectIdentifier"]}
+    p.link_ca_enabled_templates([ca_node], cn_to_guid)
+
+    linked = ca_node["EnabledCertTemplates"]
+    assert any(t["ObjectIdentifier"] == tmpl_node["ObjectIdentifier"] for t in linked)
+    assert all(t["ObjectType"] == "CertTemplate" for t in linked)

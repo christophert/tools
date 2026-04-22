@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -546,6 +547,113 @@ def build_bh_ou(entry: dict, domain_fqdn: str) -> dict | None:
     }
 
 
+def _cert_thumbprint(der_bytes: bytes) -> str:
+    return hashlib.sha1(der_bytes).hexdigest().upper()
+
+
+def _get_guid_from_entry(entry: dict) -> str | None:
+    raw_vals = _get_attr(entry.get("attrs", {}), "objectGUID")
+    if not raw_vals:
+        return None
+    v = raw_vals[0]
+    if isinstance(v, bytes):
+        try:
+            return decode_guid(v)
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
+def build_bh_ca(entry: dict, domain_fqdn: str) -> dict | None:
+    attrs = entry.get("attrs", {})
+    guid = _get_guid_from_entry(entry)
+    if not guid:
+        return None
+
+    cn = (_get_attr(attrs, "cn") or [""])[0]
+    cert_ders = [v for v in _get_attr(attrs, "cACertificate") if isinstance(v, bytes)]
+    certthumbprint = _cert_thumbprint(cert_ders[0]) if cert_ders else None
+    certchain = [_cert_thumbprint(d) for d in cert_ders]
+
+    props = {
+        "name": cn.upper(),
+        "domain": domain_fqdn,
+        "distinguishedname": entry["dn"].upper(),
+        "objectid": guid,
+        "caname": cn,
+        "dnshostname": (_get_attr(attrs, "dNSHostName") or [None])[0],
+        "certthumbprint": certthumbprint,
+        "certchain": certchain,
+        "certificatetemplates": _get_attr(attrs, "certificateTemplates"),
+        "flags": int((_get_attr(attrs, "flags") or ["0"])[0]),
+    }
+
+    return {
+        "Properties": props,
+        "ObjectIdentifier": guid,
+        "IsACLProtected": False,
+        "IsDeleted": False,
+        "Aces": [],
+        "EnabledCertTemplates": [],
+    }
+
+
+def build_bh_cert_template(entry: dict, domain_fqdn: str) -> dict | None:
+    attrs = entry.get("attrs", {})
+    guid = _get_guid_from_entry(entry)
+    if not guid:
+        return None
+
+    cn = (_get_attr(attrs, "cn") or [""])[0]
+
+    def _int_attr(name, default=0):
+        try:
+            return int((_get_attr(attrs, name) or [str(default)])[0])
+        except (ValueError, TypeError):
+            return default
+
+    name_flag = _int_attr("msPKI-Certificate-Name-Flag")
+    enroll_flag = _int_attr("msPKI-Enrollment-Flag")
+    schema = _int_attr("msPKI-Template-Schema-Version", 1)
+    auth_sigs = _int_attr("msPKI-RA-Signature")
+
+    props = {
+        "name": f"{cn.upper()}@{domain_fqdn}",
+        "domain": domain_fqdn,
+        "distinguishedname": entry["dn"].upper(),
+        "objectid": guid,
+        "displayname": (_get_attr(attrs, "displayName") or [cn])[0],
+        "schemaversion": schema,
+        "enrolleesuppliessubject": bool(name_flag & 0x00000001),
+        "requiresmanagerapproval": bool(enroll_flag & 0x00000002),
+        "authorizedsignatures": auth_sigs,
+        "ekus": _get_attr(attrs, "pKIExtendedKeyUsage"),
+        "certificateapplicationpolicy": _get_attr(attrs, "msPKI-Certificate-Application-Policy"),
+        "subjectaltrequireupn": bool(name_flag & 0x00000040),
+        "nosecurityextension": bool(enroll_flag & 0x00000100),
+    }
+
+    return {
+        "Properties": props,
+        "ObjectIdentifier": guid,
+        "IsACLProtected": False,
+        "IsDeleted": False,
+        "Aces": [],
+    }
+
+
+def link_ca_enabled_templates(ca_nodes: list, cn_to_guid: dict) -> None:
+    """Populate EnabledCertTemplates on each CA node using a template CN→GUID map."""
+    for node in ca_nodes:
+        template_names = node["Properties"].get("certificatetemplates", [])
+        linked = []
+        for name in template_names:
+            tmpl_guid = cn_to_guid.get(name.lower())
+            if tmpl_guid:
+                linked.append({"ObjectIdentifier": tmpl_guid, "ObjectType": "CertTemplate"})
+        node["EnabledCertTemplates"] = linked
+
+
 def _filetime_to_unix(value: str) -> int | None:
     try:
         v = int(value)
@@ -648,6 +756,10 @@ def build_dn_to_type_map(conn: sqlite3.Connection) -> dict:
             t = "Group"
         elif "user" in classes:
             t = "User"
+        elif "pkienrollmentservice" in classes:
+            t = "EnterpriseCA"
+        elif "pkicertificatetemplate" in classes:
+            t = "CertTemplate"
         else:
             t = "Base"
         mapping[row["dn"].lower()] = t
@@ -725,7 +837,7 @@ def cmd_export_bh(args):
 
     all_rows = conn.execute("SELECT dn, object_class, attrs_json FROM entries").fetchall()
 
-    buckets = {"users": [], "groups": [], "computers": [], "domains": [], "ous": []}
+    buckets = {"users": [], "groups": [], "computers": [], "domains": [], "ous": [], "cas": [], "certtemplates": []}
     all_entries = []
 
     for row in all_rows:
@@ -764,9 +876,21 @@ def cmd_export_bh(args):
             node = build_bh_ou(entry, domain_fqdn)
             if node:
                 buckets["ous"].append(node)
+        elif "pkienrollmentservice" in classes:
+            node = build_bh_ca(entry, domain_fqdn)
+            if node:
+                buckets["cas"].append(node)
+        elif "pkicertificatetemplate" in classes:
+            node = build_bh_cert_template(entry, domain_fqdn)
+            if node:
+                buckets["certtemplates"].append(node)
 
     reverse = build_memberof_reverse_map(all_entries, dn_to_sid, dn_to_type)
     merge_memberof_into_groups(buckets["groups"], reverse, dn_to_sid)
+
+    cn_to_guid = {node["Properties"]["displayname"].lower(): node["ObjectIdentifier"]
+                  for node in buckets["certtemplates"]}
+    link_ca_enabled_templates(buckets["cas"], cn_to_guid)
 
     type_map = {
         "users": "users",
@@ -774,6 +898,8 @@ def cmd_export_bh(args):
         "computers": "computers",
         "domains": "domains",
         "ous": "ous",
+        "cas": "enterpriseca",
+        "certtemplates": "certtemplates",
     }
 
     for key, data in buckets.items():
