@@ -380,6 +380,85 @@ def test_extract_domain_from_dn():
     assert p.extract_domain_from_dn(dn) == "CORP.EXAMPLE.COM"
 
 
+# ---------------------------------------------------------------------------
+# _get_attr helper
+# ---------------------------------------------------------------------------
+
+def test_get_attr_exact_match():
+    assert p._get_attr({"member": ["CN=A,DC=corp,DC=com"]}, "member") == ["CN=A,DC=corp,DC=com"]
+
+
+def test_get_attr_case_insensitive():
+    assert p._get_attr({"memberOf": ["CN=Admins,DC=corp,DC=com"]}, "memberof") == ["CN=Admins,DC=corp,DC=com"]
+    assert p._get_attr({"MEMBEROF": ["CN=Admins,DC=corp,DC=com"]}, "memberOf") == ["CN=Admins,DC=corp,DC=com"]
+    assert p._get_attr({"sAMAccountName": ["alice"]}, "samaccountname") == ["alice"]
+
+
+def test_get_attr_range_suffix_single():
+    attrs = {"member;range=0-1499": ["CN=A,DC=corp,DC=com", "CN=B,DC=corp,DC=com"]}
+    result = p._get_attr(attrs, "member")
+    assert "CN=A,DC=corp,DC=com" in result
+    assert "CN=B,DC=corp,DC=com" in result
+
+
+def test_get_attr_range_suffix_multiple_chunks():
+    attrs = {
+        "member;range=0-1499": ["CN=A,DC=corp,DC=com"],
+        "member;range=1500-2999": ["CN=B,DC=corp,DC=com"],
+        "member;range=3000-*": ["CN=C,DC=corp,DC=com"],
+    }
+    result = p._get_attr(attrs, "member")
+    assert len(result) == 3
+    assert "CN=A,DC=corp,DC=com" in result
+    assert "CN=B,DC=corp,DC=com" in result
+    assert "CN=C,DC=corp,DC=com" in result
+
+
+def test_get_attr_missing_returns_empty():
+    assert p._get_attr({}, "nonexistent") == []
+    assert p._get_attr({"other": ["val"]}, "missing") == []
+
+
+def test_get_attr_range_case_insensitive():
+    attrs = {"Member;Range=0-1499": ["CN=A,DC=corp,DC=com"]}
+    assert p._get_attr(attrs, "member") == ["CN=A,DC=corp,DC=com"]
+
+
+def test_bh_group_members_via_range_attr():
+    """Groups with member;range=0-1499 should still resolve members."""
+    member_dn = "CN=alice,OU=Users,DC=corp,DC=example,DC=com"
+    member_sid = "S-1-5-21-111-222-333-1000"
+    dn_to_sid = {member_dn.lower(): member_sid}
+    dn_to_type = {member_dn.lower(): "User"}
+
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+    entry = {
+        "dn": "CN=Domain Admins,CN=Users,DC=corp,DC=example,DC=com",
+        "attrs": {
+            "objectClass": ["top", "group"],
+            "sAMAccountName": ["Domain Admins"],
+            "objectSid": [group_sid_raw],
+            "member;range=0-1499": [member_dn],  # range attribute instead of plain member
+        },
+    }
+    node = p.build_bh_group(entry, DOMAIN_FQDN, DOMAIN_SID, dn_to_sid, dn_to_type)
+    assert node is not None
+    assert len(node["Members"]) == 1
+    assert node["Members"][0]["MemberId"] == member_sid
+
+
+def test_memberof_case_insensitive_in_reverse_map():
+    """memberOf stored as lowercase 'memberof' should still populate group membership."""
+    dn_to_sid, dn_to_type, group_entry, user_entry = _make_memberof_scenario()
+    # Simulate ldapsearch lowercasing the attribute name
+    user_entry["attrs"]["memberof"] = user_entry["attrs"].pop("memberOf")
+
+    entries = [group_entry, user_entry]
+    reverse = p.build_memberof_reverse_map(entries, dn_to_sid, dn_to_type)
+    assert GROUP_DN.lower() in reverse
+    assert reverse[GROUP_DN.lower()][0]["MemberId"] == USER_SID
+
+
 def test_build_dn_to_sid_map():
     conn = _make_conn()
     raw_sid = _make_sid_bytes([21, 111, 222, 333, 1000])
@@ -540,3 +619,139 @@ def test_merge_memberof_skips_unknown_group_dn():
     reverse = p.build_memberof_reverse_map([user_entry], dn_to_sid, dn_to_type)
     # No known group DN in reverse map, no crash
     assert reverse == {}
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: LDIF text → SQLite → export logic (catches round-trip bugs)
+# ---------------------------------------------------------------------------
+
+def _run_export_buckets(conn):
+    """Inline the export logic from cmd_export_bh so tests can call it directly."""
+    domain_fqdn = "DOM.AI"
+    domain_sid = "S-1-5-21-111-222-333"
+
+    dn_to_sid = p.build_dn_to_sid_map(conn)
+    dn_to_type = p.build_dn_to_type_map(conn)
+
+    all_rows = conn.execute("SELECT dn, object_class, attrs_json FROM entries").fetchall()
+    buckets = {"users": [], "groups": [], "computers": [], "domains": [], "ous": []}
+    all_entries = []
+
+    for row in all_rows:
+        classes = (row["object_class"] or "").lower().split(",")
+        attrs_raw = json.loads(row["attrs_json"])
+        attrs = {}
+        for k, vals in attrs_raw.items():
+            decoded = []
+            for v in vals:
+                if isinstance(v, str) and v.startswith("hex:"):
+                    decoded.append(bytes.fromhex(v[4:]))
+                else:
+                    decoded.append(v)
+            attrs[k] = decoded
+        entry = {"dn": row["dn"], "attrs": attrs}
+        all_entries.append(entry)
+
+        if "group" in classes:
+            node = p.build_bh_group(entry, domain_fqdn, domain_sid, dn_to_sid, dn_to_type)
+            if node:
+                buckets["groups"].append(node)
+        elif "user" in classes:
+            node = p.build_bh_user(entry, domain_fqdn, domain_sid)
+            if node:
+                buckets["users"].append(node)
+
+    reverse = p.build_memberof_reverse_map(all_entries, dn_to_sid, dn_to_type)
+    p.merge_memberof_into_groups(buckets["groups"], reverse, dn_to_sid)
+    return buckets, dn_to_sid
+
+
+def _ldif_with_wrapped_memberof():
+    """
+    Build an LDIF string that matches the user's exact format:
+    - ldapsearch comment line before each entry
+    - DN wraps mid-component
+    - memberOf wraps mid-DC-component
+    - objectSid is binary (base64 with :: prefix)
+    """
+    user_sid_raw = _make_sid_bytes([21, 111, 222, 333, 1000])
+    group_sid_raw = _make_sid_bytes([21, 111, 222, 333, 512])
+    user_sid_b64 = base64.b64encode(user_sid_raw).decode()
+    group_sid_b64 = base64.b64encode(group_sid_raw).decode()
+
+    # Wrap memberOf mid-DC-component, exactly like the user's snippet
+    return (
+        "# User, OU1, OU2, Contractors, User Accounts - XXXX, XXXX, DOM.AI\n"
+        "dn: CN=User,OU=OU1,OU=OU2,OU=Contractors,OU=User Accounts - XX\n"
+        " XX,OU=XXXX,DC=DOM,DC=AI\n"
+        "objectClass: top\n"
+        "objectClass: person\n"
+        "objectClass: organizationalPerson\n"
+        "objectClass: user\n"
+        "sAMAccountName: User\n"
+        f"objectSid:: {user_sid_b64}\n"
+        "primaryGroupID: 513\n"
+        "memberOf: CN=OU3,OU=_OU4,OU=OU5,OU=XXXX,DC=DOM,DC\n"
+        " =AI\n"
+        "\n"
+        "# OU3, _OU4, OU5, XXXX, DOM.AI\n"
+        "dn: CN=OU3,OU=_OU4,OU=OU5,OU=XXXX,DC=DOM,DC=AI\n"
+        "objectClass: top\n"
+        "objectClass: group\n"
+        "sAMAccountName: OU3\n"
+        f"objectSid:: {group_sid_b64}\n"
+        "\n"
+    )
+
+
+def test_e2e_ldif_parses_two_entries():
+    ldif = _ldif_with_wrapped_memberof()
+    entries = p.parse_ldif(ldif)
+    assert len(entries) == 2
+
+
+def test_e2e_user_dn_unwrapped_correctly():
+    ldif = _ldif_with_wrapped_memberof()
+    entries = p.parse_ldif(ldif)
+    user = next(e for e in entries if "User Accounts" in e["dn"])
+    assert user["dn"] == "CN=User,OU=OU1,OU=OU2,OU=Contractors,OU=User Accounts - XXXX,OU=XXXX,DC=DOM,DC=AI"
+
+
+def test_e2e_memberof_dn_unwrapped_correctly():
+    ldif = _ldif_with_wrapped_memberof()
+    entries = p.parse_ldif(ldif)
+    user = next(e for e in entries if "User Accounts" in e["dn"])
+    member_of = user["attrs"].get("memberOf", [])
+    assert len(member_of) == 1
+    assert member_of[0] == "CN=OU3,OU=_OU4,OU=OU5,OU=XXXX,DC=DOM,DC=AI"
+
+
+def test_e2e_group_in_dn_to_sid_after_parse():
+    ldif = _ldif_with_wrapped_memberof()
+    entries = p.parse_ldif(ldif)
+    conn = _make_conn()
+    p.insert_entries_batch(conn, entries)
+    dn_to_sid = p.build_dn_to_sid_map(conn)
+    assert "cn=ou3,ou=_ou4,ou=ou5,ou=xxxx,dc=dom,dc=ai" in dn_to_sid
+
+
+def test_e2e_group_has_member_via_memberof_after_full_pipeline():
+    """Full pipeline: LDIF with wrapped memberOf → SQLite → export → group.Members populated."""
+    ldif = _ldif_with_wrapped_memberof()
+    entries = p.parse_ldif(ldif)
+    conn = _make_conn()
+    p.insert_entries_batch(conn, entries)
+
+    buckets, dn_to_sid = _run_export_buckets(conn)
+
+    assert len(buckets["users"]) == 1, f"Expected 1 user, got {len(buckets['users'])}"
+    assert len(buckets["groups"]) == 1, f"Expected 1 group, got {len(buckets['groups'])}"
+
+    group_node = buckets["groups"][0]
+    user_node = buckets["users"][0]
+
+    assert len(group_node["Members"]) == 1, (
+        f"Expected group to have 1 member via memberOf, got {group_node['Members']}"
+    )
+    assert group_node["Members"][0]["MemberId"] == user_node["ObjectIdentifier"]
+    assert group_node["Members"][0]["MemberType"] == "User"

@@ -204,7 +204,7 @@ def _serialize_attrs(attrs: dict) -> dict:
 def insert_entry(conn: sqlite3.Connection, entry: dict) -> int:
     dn = entry["dn"]
     attrs = entry.get("attrs", {})
-    object_class = ",".join(attrs.get("objectClass", []))
+    object_class = ",".join(_get_attr(attrs, "objectClass"))
     attrs_json = json.dumps(_serialize_attrs(attrs))
 
     cur = conn.execute(
@@ -310,7 +310,7 @@ def format_table(rows: list, extra_attrs: list | None = None) -> str:
         if extra_attrs:
             attrs = json.loads(row["attrs_json"])
             for a in extra_attrs:
-                vals = attrs.get(a, attrs.get(a.lower(), []))
+                vals = _get_attr(attrs, a)
                 r.append(", ".join(str(v) for v in vals) if vals else "")
             headers_full = headers + extra_attrs
         else:
@@ -325,13 +325,29 @@ def format_table(rows: list, extra_attrs: list | None = None) -> str:
 # BloodHound Builders
 # ---------------------------------------------------------------------------
 
+def _get_attr(attrs: dict, name: str) -> list:
+    """Case-insensitive attribute lookup that merges range-paged variants.
+
+    Handles two real-world ldapsearch quirks:
+    - Attribute names may be lowercased by the client (memberOf → memberof)
+    - Large AD groups emit member;range=0-1499, member;range=1500-* etc.
+      instead of a single member attribute.
+    """
+    name_lower = name.lower()
+    result = []
+    for k, v in attrs.items():
+        if k.split(";")[0].lower() == name_lower:
+            result.extend(v)
+    return result
+
+
 def extract_domain_from_dn(dn: str) -> str:
     parts = re.findall(r"DC=([^,]+)", dn, re.IGNORECASE)
     return ".".join(p.upper() for p in parts)
 
 
 def _get_sid_from_entry(entry: dict) -> str | None:
-    raw_vals = entry.get("attrs", {}).get("objectSid", [])
+    raw_vals = _get_attr(entry.get("attrs", {}), "objectSid")
     if not raw_vals:
         return None
     v = raw_vals[0]
@@ -349,16 +365,16 @@ def build_bh_user(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | None
     if not sid:
         return None
 
-    sam = (attrs.get("sAMAccountName", [""]))[0]
+    sam = (_get_attr(attrs, "sAMAccountName") or [""])[0]
     name = f"{sam.upper()}@{domain_fqdn}"
 
-    uac_vals = attrs.get("userAccountControl", [])
+    uac_vals = _get_attr(attrs, "userAccountControl")
     uac = parse_uac(uac_vals[0]) if uac_vals else {"enabled": True, "DONT_EXPIRE_PASSWORD": False,
                                                      "TRUSTED_FOR_DELEGATION": False, "DONT_REQ_PREAUTH": False,
                                                      "PASSWD_NOTREQD": False, "SMARTCARD_REQUIRED": False}
 
-    spns = attrs.get("servicePrincipalName", [])
-    primary_gid = (attrs.get("primaryGroupID", ["513"]))[0]
+    spns = _get_attr(attrs, "servicePrincipalName")
+    primary_gid = (_get_attr(attrs, "primaryGroupID") or ["513"])[0]
 
     props = {
         "name": name,
@@ -366,24 +382,24 @@ def build_bh_user(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | None
         "domainsid": domain_sid,
         "distinguishedname": entry["dn"].upper(),
         "samaccountname": sam,
-        "email": (attrs.get("mail", [None]))[0],
-        "title": (attrs.get("title", [None]))[0],
-        "description": (attrs.get("description", [None]))[0],
+        "email": (_get_attr(attrs, "mail") or [None])[0],
+        "title": (_get_attr(attrs, "title") or [None])[0],
+        "description": (_get_attr(attrs, "description") or [None])[0],
         "enabled": uac.get("enabled", True),
-        "lastlogon": _filetime_to_unix(attrs.get("lastLogon", ["0"])[0]),
-        "lastlogontimestamp": _filetime_to_unix(attrs.get("lastLogonTimestamp", ["0"])[0]),
-        "pwdlastset": _filetime_to_unix(attrs.get("pwdLastSet", ["0"])[0]),
+        "lastlogon": _filetime_to_unix((_get_attr(attrs, "lastLogon") or ["0"])[0]),
+        "lastlogontimestamp": _filetime_to_unix((_get_attr(attrs, "lastLogonTimestamp") or ["0"])[0]),
+        "pwdlastset": _filetime_to_unix((_get_attr(attrs, "pwdLastSet") or ["0"])[0]),
         "dontreqpreauth": uac.get("DONT_REQ_PREAUTH", False),
         "passwordnotreqd": uac.get("PASSWD_NOTREQD", False),
         "sensitive": False,
         "serviceprincipalnames": spns,
         "hasspn": bool(spns),
-        "displayname": (attrs.get("displayName", [None]))[0],
+        "displayname": (_get_attr(attrs, "displayName") or [None])[0],
         "pwdneverexpires": uac.get("DONT_EXPIRE_PASSWORD", False),
-        "admincount": bool(attrs.get("adminCount", ["0"])[0] == "1"),
+        "admincount": bool((_get_attr(attrs, "adminCount") or ["0"])[0] == "1"),
         "unconstraineddelegation": uac.get("TRUSTED_FOR_DELEGATION", False),
         "objectid": sid,
-        "whencreated": _filetime_to_unix(attrs.get("whenCreated", ["0"])[0]),
+        "whencreated": _filetime_to_unix((_get_attr(attrs, "whenCreated") or ["0"])[0]),
     }
 
     return {
@@ -404,9 +420,9 @@ def build_bh_group(entry: dict, domain_fqdn: str, domain_sid: str,
     if not sid:
         return None
 
-    sam = (attrs.get("sAMAccountName", [""]))[0]
+    sam = (_get_attr(attrs, "sAMAccountName") or [""])[0]
     name = f"{sam.upper()}@{domain_fqdn}"
-    member_dns = attrs.get("member", [])
+    member_dns = _get_attr(attrs, "member")
     members = []
     for mdn in member_dns:
         mdn_lower = mdn.lower()
@@ -422,8 +438,8 @@ def build_bh_group(entry: dict, domain_fqdn: str, domain_sid: str,
         "domainsid": domain_sid,
         "distinguishedname": entry["dn"].upper(),
         "samaccountname": sam,
-        "description": (attrs.get("description", [None]))[0],
-        "admincount": bool(attrs.get("adminCount", ["0"])[0] == "1"),
+        "description": (_get_attr(attrs, "description") or [None])[0],
+        "admincount": bool((_get_attr(attrs, "adminCount") or ["0"])[0] == "1"),
         "objectid": sid,
     }
 
@@ -442,11 +458,11 @@ def build_bh_computer(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | 
     if not sid:
         return None
 
-    sam = (attrs.get("sAMAccountName", [""]))[0].rstrip("$")
-    dns_name = (attrs.get("dNSHostName", [None]))[0]
+    sam = (_get_attr(attrs, "sAMAccountName") or [""])[0].rstrip("$")
+    dns_name = (_get_attr(attrs, "dNSHostName") or [None])[0]
     name = (dns_name or f"{sam}.{domain_fqdn}").upper()
 
-    uac_vals = attrs.get("userAccountControl", [])
+    uac_vals = _get_attr(attrs, "userAccountControl")
     uac = parse_uac(uac_vals[0]) if uac_vals else {}
 
     props = {
@@ -456,8 +472,8 @@ def build_bh_computer(entry: dict, domain_fqdn: str, domain_sid: str) -> dict | 
         "distinguishedname": entry["dn"].upper(),
         "samaccountname": sam,
         "dnshostname": dns_name,
-        "operatingsystem": (attrs.get("operatingSystem", [None]))[0],
-        "operatingsystemversion": (attrs.get("operatingSystemVersion", [None]))[0],
+        "operatingsystem": (_get_attr(attrs, "operatingSystem") or [None])[0],
+        "operatingsystemversion": (_get_attr(attrs, "operatingSystemVersion") or [None])[0],
         "enabled": uac.get("enabled", True),
         "unconstraineddelegation": uac.get("TRUSTED_FOR_DELEGATION", False),
         "objectid": sid,
@@ -483,7 +499,7 @@ def build_bh_domain(entry: dict) -> dict | None:
         "domain": fqdn,
         "distinguishedname": entry["dn"].upper(),
         "objectid": sid,
-        "functionallevel": (attrs.get("msDS-Behavior-Version", [None]))[0],
+        "functionallevel": (_get_attr(attrs, "msDS-Behavior-Version") or [None])[0],
     }
 
     return {
@@ -496,7 +512,7 @@ def build_bh_domain(entry: dict) -> dict | None:
 
 def build_bh_ou(entry: dict, domain_fqdn: str) -> dict | None:
     attrs = entry.get("attrs", {})
-    guid_vals = attrs.get("objectGUID", [])
+    guid_vals = _get_attr(attrs, "objectGUID")
     if not guid_vals:
         return None
     raw = guid_vals[0]
@@ -508,12 +524,12 @@ def build_bh_ou(entry: dict, domain_fqdn: str) -> dict | None:
     else:
         guid = raw
 
-    name = (attrs.get("name", [""]))[0]
+    name = (_get_attr(attrs, "name") or [""])[0]
     props = {
         "name": f"{name.upper()}@{domain_fqdn}",
         "domain": domain_fqdn,
         "distinguishedname": entry["dn"].upper(),
-        "description": (attrs.get("description", [None]))[0],
+        "description": (_get_attr(attrs, "description") or [None])[0],
         "objectid": guid,
     }
 
@@ -565,7 +581,7 @@ def build_memberof_reverse_map(entries: list, dn_to_sid: dict, dn_to_type: dict)
     reverse = {}
     for entry in entries:
         attrs = entry.get("attrs", {})
-        member_of_dns = attrs.get("memberOf", [])
+        member_of_dns = _get_attr(attrs, "memberOf")
         if not member_of_dns:
             continue
         obj_dn_lower = entry["dn"].lower()
@@ -645,7 +661,7 @@ def cmd_parse(args):
         for entry in entries:
             dn = entry["dn"]
             attrs = entry.get("attrs", {})
-            object_class = ",".join(attrs.get("objectClass", []))
+            object_class = ",".join(_get_attr(attrs, "objectClass"))
             attrs_json = json.dumps(_serialize_attrs(attrs))
             conn.execute(
                 "INSERT OR REPLACE INTO entries (dn, object_class, attrs_json) VALUES (?, ?, ?)",
@@ -657,7 +673,7 @@ def cmd_parse(args):
 
     # detect domain and store in meta
     for entry in entries:
-        classes = entry.get("attrs", {}).get("objectClass", [])
+        classes = _get_attr(entry.get("attrs", {}), "objectClass")
         if "domain" in [c.lower() for c in classes]:
             fqdn = extract_domain_from_dn(entry["dn"])
             store_meta(conn, "domain_fqdn", fqdn)
