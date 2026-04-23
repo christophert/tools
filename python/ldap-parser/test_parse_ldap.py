@@ -1079,3 +1079,31 @@ def test_e2e_enabled_cert_templates_linked():
     linked = ca_node["EnabledCertTemplates"]
     assert any(t["ObjectIdentifier"] == tmpl_node["ObjectIdentifier"] for t in linked)
     assert all(t["ObjectType"] == "CertTemplate" for t in linked)
+
+
+def test_build_bh_cert_template_stores_cn():
+    """cn is stored in Properties so the CA→template link can match by CN."""
+    node = p.build_bh_cert_template(_template_entry(cn="Machine"), DOMAIN_FQDN)
+    assert node["Properties"]["cn"] == "Machine"
+
+
+def test_link_ca_enabled_templates_matches_by_cn_not_displayname():
+    """CA certificateTemplates stores CN values; ensure link works when CN != displayName."""
+    ca_entry = _ca_entry()
+    # CA publishes "Machine" (CN), but the template's displayName is "Computer" (as in AD)
+    ca_entry["attrs"]["certificateTemplates"] = ["Machine"]
+    ca_node = p.build_bh_ca(ca_entry, DOMAIN_FQDN)
+
+    tmpl_entry = _template_entry(cn="Machine")
+    tmpl_entry["attrs"]["displayName"] = ["Computer"]  # displayName differs from cn
+    tmpl_node = p.build_bh_cert_template(tmpl_entry, DOMAIN_FQDN)
+
+    # Build cn_to_guid the same way cmd_export_bh does
+    cn_to_guid = {}
+    cn_to_guid[tmpl_node["Properties"]["cn"].lower()] = tmpl_node["ObjectIdentifier"]
+    cn_to_guid[tmpl_node["Properties"]["displayname"].lower()] = tmpl_node["ObjectIdentifier"]
+
+    p.link_ca_enabled_templates([ca_node], cn_to_guid)
+    linked = ca_node["EnabledCertTemplates"]
+    assert len(linked) == 1
+    assert linked[0]["ObjectIdentifier"] == tmpl_node["ObjectIdentifier"]

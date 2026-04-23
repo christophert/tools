@@ -622,6 +622,7 @@ def build_bh_cert_template(entry: dict, domain_fqdn: str) -> dict | None:
         "domain": domain_fqdn,
         "distinguishedname": entry["dn"].upper(),
         "objectid": guid,
+        "cn": cn,
         "displayname": (_get_attr(attrs, "displayName") or [cn])[0],
         "schemaversion": schema,
         "enrolleesuppliessubject": bool(name_flag & 0x00000001),
@@ -888,8 +889,11 @@ def cmd_export_bh(args):
     reverse = build_memberof_reverse_map(all_entries, dn_to_sid, dn_to_type)
     merge_memberof_into_groups(buckets["groups"], reverse, dn_to_sid)
 
-    cn_to_guid = {node["Properties"]["displayname"].lower(): node["ObjectIdentifier"]
-                  for node in buckets["certtemplates"]}
+    cn_to_guid = {}
+    for node in buckets["certtemplates"]:
+        guid = node["ObjectIdentifier"]
+        cn_to_guid[node["Properties"]["cn"].lower()] = guid
+        cn_to_guid[node["Properties"]["displayname"].lower()] = guid
     link_ca_enabled_templates(buckets["cas"], cn_to_guid)
 
     type_map = {
