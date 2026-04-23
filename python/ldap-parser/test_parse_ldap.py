@@ -1007,13 +1007,13 @@ def test_export_ca_meta_type():
         node = p.build_bh_ca(_ca_entry(), DOMAIN_FQDN)
         if node:
             buckets["cas"].append(node)
-        type_map = {"cas": "enterpriseca", "certtemplates": "certtemplates"}
+        type_map = {"cas": "enterprisecas", "certtemplates": "certtemplates"}
         for key, data in buckets.items():
             payload = {"data": data, "meta": {"methods": 0, "type": type_map[key], "count": len(data), "version": 5}}
             out = _json.dumps(payload)
             loaded = _json.loads(out)
             if key == "cas":
-                assert loaded["meta"]["type"] == "enterpriseca"
+                assert loaded["meta"]["type"] == "enterprisecas"
             if key == "certtemplates":
                 assert loaded["meta"]["type"] == "certtemplates"
 

@@ -898,7 +898,7 @@ def cmd_export_bh(args):
         "computers": "computers",
         "domains": "domains",
         "ous": "ous",
-        "cas": "enterpriseca",
+        "cas": "enterprisecas",
         "certtemplates": "certtemplates",
     }
 
